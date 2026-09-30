@@ -7,6 +7,7 @@ tool references.
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,6 +22,8 @@ from conductor.config.schema import (
     HumanGateStepDef,
     QuestionsStepDef,
     RoutableStepBase,
+    ScriptStepDef,
+    StepSecretRef,
     TerminateStepDef,
     WorkflowStepDef,
 )
@@ -33,6 +36,12 @@ from conductor.providers.capabilities import (
     get_capabilities,
     requires_plugin_root_for_skills,
     uses_native_skills,
+)
+from conductor.providers.resolution import (
+    effective_mcp_consumer_providers,
+    format_claude_agent_sdk_remote_env_error,
+    format_remote_mcp_stdio_only_error,
+    provider_type_for_agent,
 )
 from conductor.skills import (
     BYTES_PER_TOKEN_ESTIMATE,
@@ -60,6 +69,7 @@ class _EnvironmentValidationContext(TypedDict):
     explicit: bool
     root_workflow_dir: Path | None
     warned_no_environments: bool
+    warned_no_secret_environments: bool
 
 
 # Shared Jinja2 environment used purely for AST parsing of template strings.
@@ -313,6 +323,7 @@ def validate_workflow_config(
             "explicit": False,
             "root_workflow_dir": workflow_path.parent if workflow_path is not None else None,
             "warned_no_environments": False,
+            "warned_no_secret_environments": False,
         }
 
     profile_errors, profile_warnings = _validate_profile_references(
@@ -321,6 +332,14 @@ def validate_workflow_config(
     )
     errors.extend(profile_errors)
     warnings.extend(profile_warnings)
+
+    if _has_secret_references(config):
+        secret_errors, secret_warnings = _validate_secret_references(
+            config,
+            _environment_context,
+        )
+        errors.extend(secret_errors)
+        warnings.extend(secret_warnings)
 
     # Build index of all addressable node names
     agent_names = {agent.name for agent in config.agents}
@@ -487,6 +506,12 @@ def validate_workflow_config(
     # the server) are enforced again at runtime; this is early off-network
     # diagnostics for ``conductor validate`` only.
     errors.extend(_validate_mcp_steps(config))
+
+    # Remote MCP transports consumed by stdio-only providers (Claude, OpenAI)
+    # are rejected regardless of secret references — the restriction is a
+    # property of the transport, not of secret delivery. Mirrors the manifest
+    # compiler's server-level check.
+    errors.extend(_validate_remote_mcp_provider_support(config))
 
     if errors:
         raise ConfigurationError(
@@ -778,6 +803,29 @@ def _validate_mcp_steps(config: WorkflowConfig) -> list[str]:
                     f"(line {exc.lineno})"
                 )
 
+    return errors
+
+
+def _validate_remote_mcp_provider_support(config: WorkflowConfig) -> list[str]:
+    """Reject remote MCP servers consumed by stdio-only providers.
+
+    Claude and OpenAI forward only stdio servers to their SDKs, so an
+    http/sse server consumed by either provider would be silently skipped at
+    runtime. This runs on every ``conductor validate``, with or without
+    secret references, and mirrors the manifest compiler's server-level
+    check so ``conductor run`` fails identically.
+
+    Returns:
+        List of error messages.
+    """
+    stdio_only = effective_mcp_consumer_providers(config) & {"claude", "openai"}
+    if not stdio_only:
+        return []
+    errors: list[str] = []
+    for server_name in sorted(config.workflow.runtime.mcp_servers):
+        server = config.workflow.runtime.mcp_servers[server_name]
+        if server.type in ("http", "sse"):
+            errors.append(format_remote_mcp_stdio_only_error(server_name, server.type, stdio_only))
     return errors
 
 
@@ -1511,6 +1559,311 @@ def _profile_references(config: WorkflowConfig) -> set[str]:
     return references
 
 
+def _has_secret_references(config: WorkflowConfig) -> bool:
+    """Whether the workflow declares any secret references at all.
+
+    This is the lazy gate for both validation and the ``conductor validate``
+    report: a workflow with no secret references pays zero secret-related
+    validation, output, and environment discovery.
+    """
+    for step in config.agents:
+        if (
+            isinstance(step, ExecutableStepBase)
+            and step.execution is not None
+            and step.execution.secrets
+        ):
+            return True
+    for group in config.for_each:
+        step = group.agent
+        if (
+            isinstance(step, ExecutableStepBase)
+            and step.execution is not None
+            and step.execution.secrets
+        ):
+            return True
+    return any(server.secrets for server in config.workflow.runtime.mcp_servers.values())
+
+
+def _secret_step_consumers(
+    config: WorkflowConfig,
+) -> list[tuple[str, ExecutableStepBase]]:
+    """Collect ``(consumer_label, step)`` for executable steps declaring secrets.
+
+    Labels match the manifest's executable-step identity keys, so a validator
+    message and the compiled run manifest name the same step identically.
+    """
+    consumers: list[tuple[str, ExecutableStepBase]] = []
+    for step in config.agents:
+        if (
+            isinstance(step, ExecutableStepBase)
+            and step.execution is not None
+            and step.execution.secrets
+        ):
+            consumers.append((step.name, step))
+    for group in config.for_each:
+        step = group.agent
+        if (
+            isinstance(step, ExecutableStepBase)
+            and step.execution is not None
+            and step.execution.secrets
+        ):
+            consumers.append((f"for_each.{group.name}.agent", step))
+    return consumers
+
+
+def _delivery_collision_errors(
+    consumer: str,
+    *,
+    literal_env: Iterable[str],
+    literal_headers: Iterable[str],
+    secrets: Iterable[StepSecretRef],
+) -> list[str]:
+    """Check that secret delivery names collide with nothing within one consumer.
+
+    Literal declarations (``env:`` on a script step or MCP server,
+    ``headers:`` on a server) and secret bindings share one delivery namespace
+    per consumer, so a collision is an error regardless of which side declared
+    first. Environment variable names are case-insensitive on Windows and
+    case-sensitive elsewhere; HTTP header names are always case-insensitive
+    (RFC 9110).
+    """
+    errors: list[str] = []
+    env_names = {name.casefold() if os.name == "nt" else name for name in literal_env}
+    header_names = {name.casefold() for name in literal_headers}
+    for secret in secrets:
+        delivery = secret.delivery
+        if delivery.env is not None:
+            key = delivery.env.casefold() if os.name == "nt" else delivery.env
+            if key in env_names:
+                errors.append(
+                    f"Secret delivery name '{delivery.env}' collides within consumer "
+                    f"'{consumer}' (environment variable names must be unique)."
+                )
+            env_names.add(key)
+        else:
+            assert delivery.header is not None
+            key = delivery.header.casefold()
+            if key in header_names:
+                errors.append(
+                    f"Secret delivery name '{delivery.header}' collides within consumer "
+                    f"'{consumer}' (HTTP header names are case-insensitive and must be unique)."
+                )
+            header_names.add(key)
+    return errors
+
+
+def _validate_secret_references(
+    config: WorkflowConfig,
+    context: _EnvironmentValidationContext,
+) -> tuple[list[str], list[str]]:
+    """Validate secret use-sites without resolving any secret value.
+
+    Structural checks (scope vs. use-site position, delivery transport,
+    delivery-name collisions) mirror the compile-time choke in
+    ``engine.run_manifest`` with identical message wording, so the same
+    mistake reads the same whether it surfaces at ``conductor validate`` or
+    at manifest compilation. Environment-dependent checks are three-level:
+    an explicit ``--environment`` is authoritative (allow-list violations are
+    errors; unset sources warn, because the validation machine is not
+    necessarily the run machine), ambient discovery is advisory (a reference
+    unknown to every authored environment is an error, one missing from only
+    some is a warning), and a machine with no authored environments yields a
+    single pointer at ``--environment`` — the built-in ``local/default``
+    environment is never treated as an authored one.
+    """
+    errors: list[str] = []
+    warnings: list[str] = []
+    # Only structurally valid use-sites feed the environment checks — a secret
+    # that already failed a structural check is not re-reported against the
+    # environment, mirroring the manifest compiler's fail-fast order.
+    references: list[tuple[str, str, str]] = []
+    consumers = effective_mcp_consumer_providers(config)
+
+    for key, step in _secret_step_consumers(config):
+        assert step.execution is not None
+        secrets = step.execution.secrets
+        if not isinstance(step, ScriptStepDef) or any(
+            secret.scope == "agent" for secret in secrets
+        ):
+            errors.append(
+                f"Step '{key}' requests secret delivery, but agent-scope delivery is "
+                "reserved until agent execution realms (step 7)."
+            )
+            continue
+        for secret in secrets:
+            if secret.delivery.header is not None:
+                errors.append(
+                    f"Script step '{key}' requests header delivery for secret "
+                    f"'{secret.ref}', but header delivery is MCP-only."
+                )
+                continue
+            if secret.scope != "script":
+                errors.append(
+                    f"Script step '{key}' cannot consume secret '{secret.ref}' with scope "
+                    f"'{secret.scope}'; this position requires scope 'script'."
+                )
+                continue
+            references.append((secret.ref, secret.scope, key))
+        errors.extend(
+            _delivery_collision_errors(
+                key,
+                literal_env=step.env,
+                literal_headers=(),
+                secrets=secrets,
+            )
+        )
+
+    for server_name in sorted(config.workflow.runtime.mcp_servers):
+        server = config.workflow.runtime.mcp_servers[server_name]
+        consumer = f"mcp:{server_name}"
+        if server.type in ("http", "sse"):
+            stdio_only = consumers & {"claude", "openai"}
+            if stdio_only:
+                # Already reported by the unconditional remote-transport
+                # check; skip to mirror the compiler's fail-fast order.
+                continue
+        for secret in server.secrets:
+            if secret.scope == "agent":
+                errors.append(
+                    f"MCP server '{server_name}' requests agent-scope delivery, but "
+                    "agent-scope delivery is reserved until agent execution realms (step 7)."
+                )
+                continue
+            if secret.scope != "mcp":
+                errors.append(
+                    f"MCP server '{server_name}' cannot consume secret '{secret.ref}' with "
+                    f"scope '{secret.scope}'; this position requires scope 'mcp'."
+                )
+                continue
+            if secret.delivery.header is not None and server.type == "stdio":
+                errors.append(
+                    f"MCP server '{server_name}' uses transport 'stdio', which cannot "
+                    f"deliver secret '{secret.ref}' through an HTTP header."
+                )
+                continue
+            if (
+                secret.delivery.env is not None
+                and server.type in ("http", "sse")
+                and "claude-agent-sdk" in consumers
+            ):
+                errors.append(
+                    format_claude_agent_sdk_remote_env_error(
+                        server_name,
+                        server.type,
+                        secret.ref,
+                    )
+                )
+                continue
+            references.append((secret.ref, secret.scope, consumer))
+        errors.extend(
+            _delivery_collision_errors(
+                consumer,
+                literal_env=server.env,
+                literal_headers=server.headers,
+                secrets=server.secrets,
+            )
+        )
+
+    context["refs_found"] = True
+    if context["explicit"]:
+        # The explicitly resolved environment is authoritative. Unknown refs
+        # are reported here (not assumed to have failed compilation): only
+        # the root manifest is compiled before this validator recursively
+        # re-runs on child workflows, so a child reference has no compilation
+        # choke point above it. The allow list — which the compiler does not
+        # check — and unset sources are likewise reported here.
+        environments = context["environments"] or {}
+        environment = next((item for item in environments.values() if item is not None), None)
+        if environment is None:
+            return errors, warnings
+        bindings = environment.document.secrets or {}
+        for reference, scope, consumer in references:
+            binding = bindings.get(reference)
+            if binding is None:
+                # Only the root manifest is compiled before this validator
+                # recursively re-runs on child workflows (which no manifest
+                # compilation covered), so an unknown reference is reported
+                # here rather than assumed to have been rejected already.
+                errors.append(
+                    f"Secret reference '{reference}' used by '{consumer}' is not defined "
+                    f"in environment '{environment.name}'."
+                )
+                continue
+            if binding.allow is not None and scope not in binding.allow:
+                allowed = ", ".join(binding.allow) if binding.allow else "none"
+                errors.append(
+                    f"Secret '{reference}' cannot be used by {scope} consumer "
+                    f"'{consumer}': binding allow list is [{allowed}]."
+                )
+        for name, binding in sorted(bindings.items()):
+            env_var = binding.source.env
+            if env_var is not None and os.environ.get(env_var) is None:
+                warnings.append(
+                    f"secret binding '{name}' uses an environment source that is unset on "
+                    "this validation machine"
+                )
+        return errors, warnings
+
+    if context["environments"] is None:
+        root_workflow_dir = context["root_workflow_dir"]
+        if root_workflow_dir is not None:
+            from conductor.config.environment import discover_all_environments
+
+            malformed_environment_names: set[str] = set()
+
+            def record_discovery_warning(message: str) -> None:
+                warnings.append(message)
+                match = re.search(r"environment document (.+?\.ya?ml):", message)
+                if match is not None:
+                    malformed_environment_names.add(Path(match.group(1)).stem)
+
+            discovered = discover_all_environments(
+                root_workflow_dir,
+                on_warning=record_discovery_warning,
+            )
+            context["environments"] = {
+                **discovered,
+                **dict.fromkeys(malformed_environment_names),
+            }
+
+    environments = context["environments"] or {}
+    # The built-in ``local/default`` environment is never an authored one:
+    # even if a future discovery change surfaced it here, it must not count
+    # toward the ambient cross-check (Metis RISK-4).
+    authored = {
+        name: environment
+        for name, environment in environments.items()
+        if environment is None or environment.source != "builtin"
+    }
+    if not authored:
+        if not context["warned_no_secret_environments"]:
+            warnings.append(
+                "secret references could not be checked against any authored environment; "
+                "run conductor validate --environment <name> for the full cross-check"
+            )
+            context["warned_no_secret_environments"] = True
+        return errors, warnings
+
+    environment_names = sorted(authored)
+    for reference in sorted({reference for reference, _, _ in references}):
+        missing: list[str] = []
+        for name in environment_names:
+            environment = authored[name]
+            if environment is None or reference not in (environment.document.secrets or {}):
+                missing.append(name)
+        if len(missing) == len(environment_names):
+            errors.append(
+                f"secret reference '{reference}' is not defined in any discovered authored "
+                f"environment ({', '.join(environment_names)})"
+            )
+        elif missing:
+            warnings.append(
+                f"secret reference '{reference}' is absent from environment(s): "
+                f"{', '.join(missing)}"
+            )
+    return errors, warnings
+
+
 def _validate_profile_references(
     config: WorkflowConfig,
     context: _EnvironmentValidationContext,
@@ -2121,7 +2474,7 @@ def _resolved_provider_name(agent: AgentDef, default: str) -> str:
     Honors the per-agent ``provider:`` override and falls back to the
     workflow-level default.
     """
-    return agent.provider or default
+    return provider_type_for_agent(agent, default)
 
 
 def _references_loop_variable(template: str, loop_var: str) -> bool:

@@ -37,12 +37,17 @@ itself as ``non-hermetic-compatibility``: resolved profiles and backends may
 depend on machine-local environment documents, so the manifest pins what was
 resolved (names, digests, content hashes) rather than pretending the
 resolution was hermetic.
+
+**Versioning.** Version 1 is additive: new fields may be added without a
+version bump, and consumers are expected to ignore unknown keys. Defaults on
+new model fields preserve reads of manifests written by earlier v1 producers.
 """
 
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Mapping
+import sys
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from types import MappingProxyType
 from typing import Literal
@@ -53,10 +58,16 @@ from conductor.config.environment import ResolvedEnvironment
 from conductor.config.schema import (
     ExecutableStepBase,
     ScriptStepDef,
+    StepSecretRef,
     WorkflowConfig,
 )
 from conductor.exceptions import ConfigurationError
 from conductor.execution import LocalRunnerBackend, RunnerBackend
+from conductor.providers.resolution import (
+    effective_mcp_consumer_providers,
+    format_claude_agent_sdk_remote_env_error,
+    format_remote_mcp_stdio_only_error,
+)
 
 # Capability-introspection registry: backend name -> a backend instance asked
 # only for its static ``capabilities()`` declaration. The instances are
@@ -100,6 +111,17 @@ class ResolvedStepProfile(BaseModel):
 
     profile: str
     backend: str
+    inherit_control_environment: bool = True
+
+
+class ResolvedSecretUse(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    consumer: str
+    ref: str
+    scope: Literal["script", "mcp"]
+    delivery_kind: Literal["env", "header"]
+    delivery_name: str
 
 
 class AuditInfo(BaseModel):
@@ -131,6 +153,7 @@ class ResolvedRunManifest(BaseModel):
     read-only mapping: the manifest is the run's audit record, so nothing
     with a handle to it may mutate execution resolution after compilation.
     Serialization still yields a plain ``dict`` (see the field serializer)."""
+    secrets: tuple[ResolvedSecretUse, ...] = ()
     conductor_version: str
     audit: AuditInfo
 
@@ -305,6 +328,196 @@ def _require_script_backend_capability(key: str, backend_name: str) -> None:
         )
 
 
+def _require_known_secret_ref(
+    secret: StepSecretRef,
+    *,
+    consumer: str,
+    environment: ResolvedEnvironment,
+) -> None:
+    bindings = environment.document.secrets or {}
+    if secret.ref in bindings:
+        return
+    available = ", ".join(sorted(bindings)) or "none"
+    raise ConfigurationError(
+        f"Secret reference '{secret.ref}' used by '{consumer}' is not defined "
+        f"in environment '{environment.name}' (available secrets: {available}).",
+        suggestion="Declare the secret in the environment document, or use one "
+        "of the available secret names.",
+    )
+
+
+def _resolved_secret_use(
+    consumer: str,
+    secret: StepSecretRef,
+    scope: Literal["script", "mcp"],
+) -> ResolvedSecretUse:
+    if secret.delivery.env is not None:
+        return ResolvedSecretUse(
+            consumer=consumer,
+            ref=secret.ref,
+            scope=scope,
+            delivery_kind="env",
+            delivery_name=secret.delivery.env,
+        )
+    assert secret.delivery.header is not None
+    return ResolvedSecretUse(
+        consumer=consumer,
+        ref=secret.ref,
+        scope=scope,
+        delivery_kind="header",
+        delivery_name=secret.delivery.header,
+    )
+
+
+def _check_delivery_collisions(
+    consumer: str,
+    *,
+    literal_env: Iterable[str],
+    literal_headers: Iterable[str],
+    secrets: Iterable[StepSecretRef],
+) -> None:
+    """Reject delivery-name collisions within one consumer at compile time.
+
+    Mirrors ``config.validator._delivery_collision_errors`` with identical
+    wording, so the same mistake reads the same whether it surfaces at
+    ``conductor validate`` or at manifest compilation. Running here matters
+    because ``conductor run`` never invokes the semantic validator: without
+    it, two secret references collapsing onto one delivery name silently
+    let the last credential win in the delivery dicts, and a case-only
+    literal collision goes unnoticed on Windows, where environment variable
+    names are case-insensitive.
+    """
+    env_names = {name.casefold() if sys.platform == "win32" else name for name in literal_env}
+    header_names = {name.casefold() for name in literal_headers}
+    for secret in secrets:
+        delivery = secret.delivery
+        if delivery.env is not None:
+            env_key = delivery.env.casefold() if sys.platform == "win32" else delivery.env
+            if env_key in env_names:
+                raise ConfigurationError(
+                    f"Secret delivery name '{delivery.env}' collides within consumer "
+                    f"'{consumer}' (environment variable names must be unique)."
+                )
+            env_names.add(env_key)
+        else:
+            assert delivery.header is not None
+            header_key = delivery.header.casefold()
+            if header_key in header_names:
+                raise ConfigurationError(
+                    f"Secret delivery name '{delivery.header}' collides within consumer "
+                    f"'{consumer}' (HTTP header names are case-insensitive and must be unique)."
+                )
+            header_names.add(header_key)
+
+
+def _compile_step_secret_uses(
+    key: str,
+    step: ExecutableStepBase,
+    environment: ResolvedEnvironment,
+) -> list[ResolvedSecretUse]:
+    secrets = step.execution.secrets if step.execution is not None else []
+    if not secrets:
+        return []
+    if not isinstance(step, ScriptStepDef) or any(secret.scope == "agent" for secret in secrets):
+        raise ConfigurationError(
+            f"Step '{key}' requests secret delivery, but agent-scope delivery is reserved "
+            "until agent execution realms (step 7).",
+            suggestion="Remove the secret reference until agent execution realms are available.",
+        )
+
+    uses: list[ResolvedSecretUse] = []
+    for secret in secrets:
+        if secret.delivery.header is not None:
+            raise ConfigurationError(
+                f"Script step '{key}' requests header delivery for secret '{secret.ref}', "
+                "but header delivery is MCP-only.",
+                suggestion="Use delivery.env for script steps.",
+            )
+        if secret.scope != "script":
+            raise ConfigurationError(
+                f"Script step '{key}' cannot consume secret '{secret.ref}' with scope "
+                f"'{secret.scope}'; this position requires scope 'script'.",
+                suggestion="Set the secret scope to 'script' or move it to an MCP server.",
+            )
+        _require_known_secret_ref(secret, consumer=key, environment=environment)
+        uses.append(_resolved_secret_use(key, secret, "script"))
+    # Non-script steps and agent-scope refs raised above, so the literal
+    # ``env`` keys to check against are the script step's own.
+    assert isinstance(step, ScriptStepDef)
+    _check_delivery_collisions(
+        key,
+        literal_env=step.env,
+        literal_headers=(),
+        secrets=secrets,
+    )
+    return uses
+
+
+def _compile_mcp_secret_uses(
+    config: WorkflowConfig,
+    environment: ResolvedEnvironment,
+) -> list[ResolvedSecretUse]:
+    uses: list[ResolvedSecretUse] = []
+    consumers = effective_mcp_consumer_providers(config)
+    for server_name in sorted(config.workflow.runtime.mcp_servers):
+        server = config.workflow.runtime.mcp_servers[server_name]
+        consumer = f"mcp:{server_name}"
+        if server.type in ("http", "sse"):
+            stdio_only = consumers & {"claude", "openai"}
+            if stdio_only:
+                raise ConfigurationError(
+                    format_remote_mcp_stdio_only_error(
+                        server_name,
+                        server.type,
+                        stdio_only,
+                    ),
+                    suggestion="Use a stdio MCP server or override every consuming agent to a "
+                    "provider that supports remote MCP transports.",
+                )
+        for secret in server.secrets:
+            if secret.scope == "agent":
+                raise ConfigurationError(
+                    f"MCP server '{server_name}' requests agent-scope delivery, but agent-scope "
+                    "delivery is reserved until agent execution realms (step 7).",
+                    suggestion="Use scope 'mcp' for MCP server secret delivery.",
+                )
+            if secret.scope != "mcp":
+                raise ConfigurationError(
+                    f"MCP server '{server_name}' cannot consume secret '{secret.ref}' with scope "
+                    f"'{secret.scope}'; this position requires scope 'mcp'.",
+                    suggestion="Set the secret scope to 'mcp' or move it to a script step.",
+                )
+            if secret.delivery.header is not None and server.type == "stdio":
+                raise ConfigurationError(
+                    f"MCP server '{server_name}' uses transport 'stdio', which cannot deliver "
+                    f"secret '{secret.ref}' through an HTTP header.",
+                    suggestion="Use delivery.env for stdio, or an HTTP/SSE transport for headers.",
+                )
+            if (
+                secret.delivery.env is not None
+                and server.type in ("http", "sse")
+                and "claude-agent-sdk" in consumers
+            ):
+                raise ConfigurationError(
+                    format_claude_agent_sdk_remote_env_error(
+                        server_name,
+                        server.type,
+                        secret.ref,
+                    ),
+                    suggestion="Use delivery.header (e.g. header: Authorization) for remote "
+                    "servers on the claude-agent-sdk provider.",
+                )
+            _require_known_secret_ref(secret, consumer=consumer, environment=environment)
+            uses.append(_resolved_secret_use(consumer, secret, "mcp"))
+        _check_delivery_collisions(
+            consumer,
+            literal_env=server.env,
+            literal_headers=server.headers,
+            secrets=server.secrets,
+        )
+    return uses
+
+
 def compile_run_manifest(
     config: WorkflowConfig,
     *,
@@ -337,6 +550,7 @@ def compile_run_manifest(
             resolves to a backend without batch capability.
     """
     profiles: dict[str, ResolvedStepProfile] = {}
+    secrets: list[ResolvedSecretUse] = []
     for key, step in _iter_executable_steps(config):
         profile_name = _resolve_profile_name(key, step, config, environment)
         definition = environment.document.profiles.get(profile_name)
@@ -352,7 +566,19 @@ def compile_run_manifest(
         backend_name = definition.backend
         if isinstance(step, ScriptStepDef):
             _require_script_backend_capability(key, backend_name)
-        profiles[key] = ResolvedStepProfile(profile=profile_name, backend=backend_name)
+        inherit_control_environment = (
+            definition.inherit_control_environment
+            if definition.inherit_control_environment is not None
+            else backend_name == "local"
+        )
+        profiles[key] = ResolvedStepProfile(
+            profile=profile_name,
+            backend=backend_name,
+            inherit_control_environment=inherit_control_environment,
+        )
+        secrets.extend(_compile_step_secret_uses(key, step, environment))
+
+    secrets.extend(_compile_mcp_secret_uses(config, environment))
 
     digest: str | None = None
     if workflow_path is not None:
@@ -367,6 +593,7 @@ def compile_run_manifest(
             digest=environment.digest,
         ),
         profiles=profiles,
+        secrets=tuple(secrets),
         conductor_version=_conductor_version(),
         audit=AuditInfo(hermetic=False, classification="non-hermetic-compatibility"),
     )

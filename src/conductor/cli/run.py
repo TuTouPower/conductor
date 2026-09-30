@@ -24,6 +24,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from conductor import redaction
 from conductor.billing import (
     AggregateBilling,
     BillingMode,
@@ -42,15 +43,20 @@ from conductor.console import (
     select_console_glyph,
     styled,
 )
+from conductor.engine.secrets import SecretUseIndex, SecretValueCache, index_config
 from conductor.engine.workflow import ExecutionPlan, WorkflowEngine
-from conductor.exceptions import WorkflowTerminated
+from conductor.exceptions import ConfigurationError, WorkflowTerminated
 from conductor.mcp_auth import resolve_mcp_server_config
 from conductor.providers.registry import ProviderRegistry
+from conductor.redaction import RunRedactor
 
 if TYPE_CHECKING:
+    from contextvars import Token
+
+    from conductor.config.environment import ResolvedEnvironment
     from conductor.config.instructions import DiscoveredInstruction
     from conductor.config.schema import ProviderSettings, WorkflowConfig
-    from conductor.events import WorkflowEvent
+    from conductor.events import WorkflowEvent, WorkflowEventEmitter
     from conductor.fleet.records import RunMode
 
 
@@ -2187,6 +2193,65 @@ def _remove_run_record_for_current_process_safe() -> None:
         logger.warning("Failed to remove fleet run record", exc_info=True)
 
 
+def _scrub_exception_fields(exc: BaseException, redactor: RunRedactor) -> None:
+    """Scrub registered secret values from the fields a CLI error render reads.
+
+    ``print_error`` renders exception args and structured ``ConductorError``
+    fields, while ``OSError.__str__`` reads its structured filename and error
+    attributes instead of rebuilt args. This runs at the run/resume boundary
+    *before* the redactor is cleared, so the same escaping exception object
+    cannot carry plaintext into the later CLI renderer. Its class, identity,
+    traceback, cause chain, errno, and classification remain untouched.
+    """
+    if not redactor.active:
+        return
+
+    # scrub() returns unsupported types unchanged, so scrubbing every element
+    # also covers bytes args and containers (e.g. Exception({"token": secret}))
+    # whose nested strings the renderer would print.
+    exc.args = tuple(redactor.scrub(arg) for arg in exc.args)
+    from conductor.exceptions import ConductorError
+
+    if isinstance(exc, ConductorError):
+        for attribute in ("suggestion", "file_path", "field_path"):
+            value = getattr(exc, attribute, None)
+            if isinstance(value, (str, bytes)):
+                setattr(exc, attribute, redactor.scrub(value))
+
+    if isinstance(exc, OSError):
+        for attribute in ("strerror", "filename", "filename2"):
+            value = getattr(exc, attribute, None)
+            if isinstance(value, (str, bytes)):
+                setattr(exc, attribute, redactor.scrub(value))
+
+
+def _scrub_workflow_terminated(
+    exc: WorkflowTerminated,
+    redactor: RunRedactor | None,
+) -> WorkflowTerminated:
+    """Re-create a ``WorkflowTerminated`` with its rendered fields scrubbed.
+
+    ``message`` / ``output`` / ``reason`` / ``suggestion`` are all
+    Jinja-rendered from the workflow context and may carry a declared secret
+    value (Oracle R2-NF3) — and the CLI's terminate handler prints exactly
+    these fields to stdout. The scrubbed exception is therefore built as a
+    copy at this boundary (the CLI print sites stay out of the diff);
+    ``terminated_by`` is a step name, never rendered from context, and is
+    preserved verbatim. Identity passthrough when the redactor is missing or
+    inactive (byte parity for secret-less runs); the original exception is
+    never mutated.
+    """
+    if redactor is None or not redactor.active:
+        return exc
+    return WorkflowTerminated(
+        redactor.scrub(exc.args[0] if exc.args else ""),
+        output=redactor.scrub_event_data(exc.output),
+        reason=redactor.scrub(exc.reason),
+        terminated_by=exc.terminated_by,
+        suggestion=redactor.scrub(exc.suggestion) if exc.suggestion is not None else None,
+    )
+
+
 def _write_terminal_record_for_current_process(
     *,
     event_log_subscriber: Any,
@@ -2366,6 +2431,13 @@ async def run_workflow_async(
     terminal_error_type: str | None = None
     terminal_error_message: str | None = None
     engine: WorkflowEngine | None = None
+    # Secret machinery owned by the CLI: created in ``_prepare_run_secrets``
+    # and injected into the engine constructor, so the engine's session is
+    # non-owning and never clears it. The outermost finally clears both and
+    # restores the redaction contextvar after the run's final sinks drain.
+    secret_cache: SecretValueCache | None = None
+    secret_redactor: RunRedactor | None = None
+    redaction_token: Token[RunRedactor | None] | None = None
 
     if web:
         from conductor.web.server import WebDashboard
@@ -2484,10 +2556,48 @@ async def run_workflow_async(
         console_subscriber = ConsoleEventSubscriber()
         emitter.subscribe(console_subscriber.on_event)
 
+        # Resolve the execution environment and prepare the run's secret
+        # machinery up front — BEFORE the inputs print below and BEFORE
+        # ``_build_mcp_servers``: an input value equal to a declared secret
+        # must never reach the console / ``--log-file`` / bg capture logs
+        # before the redactor exists, and a broken reference must fail here,
+        # before any network or plugin-fetch work, through the CLI's existing
+        # error printer (the engine would otherwise compile the same manifest
+        # and index at construction, mid-setup).
+        resolved_environment = None
+        # ``is not None``, not truthiness: an explicitly empty selection
+        # (``--environment ""``, e.g. an unset variable forwarded as
+        # ``--environment "$ENVIRONMENT"``) must reach ``resolve_environment``
+        # and fail clearly, not silently fall back to the built-in
+        # environment — matching ``conductor validate``.
+        if environment is not None:
+            from conductor.config.environment import resolve_environment
+
+            resolved_environment = resolve_environment(
+                environment, workflow_dir=workflow_path.parent
+            )
+
+        secret_cache, secret_redactor, secret_uses = _prepare_run_secrets(
+            config, resolved_environment, emitter
+        )
+        # The contextvar token is captured BEFORE any sink below can emit
+        # (inputs print, MCP build, engine events) and is restored in the
+        # outermost finally — token discipline, never ``set_current(None)``.
+        redaction_token = redaction.set_current(secret_redactor)
+
         if inputs:
             # ``ensure_ascii=False`` so the panel shows real non-ASCII input values
-            # rather than ``\uXXXX`` escapes (issue #356).
-            verbose_log_section("Workflow Inputs", json.dumps(inputs, indent=2, ensure_ascii=False))
+            # rather than ``\uXXXX`` escapes (issue #356). The active run
+            # redactor scrubs the *inputs* before serialization — scrubbing
+            # the serialized string instead would miss any secret containing
+            # quotes, backslashes, or newlines, which JSON escaping rewrites
+            # (identity passthrough when no secrets are registered, so a
+            # secret-less run is byte-identical, and the inputs mapping
+            # itself is never mutated).
+            verbose_log_section(
+                "Workflow Inputs",
+                json.dumps(secret_redactor.scrub_event_data(inputs), indent=2, ensure_ascii=False),
+            )
 
         # Apply provider override if specified.
         # Reassigning ``runtime.provider`` to a string re-triggers the
@@ -2527,28 +2637,11 @@ async def run_workflow_async(
             _emit_loaded_instructions_debug(start_dir, print_loaded_instructions)
 
         # Convert MCP servers from workflow config to SDK format
-        mcp_servers = await _build_mcp_servers(config)
+        mcp_servers = await _build_mcp_servers(config, secrets=secret_uses)
 
         # Acquire declared plugin sources before anything runs, so a cold
         # cache costs a visible startup step rather than a stalled agent.
         plugin_marketplaces = await _prefetch_plugin_sources(config, workflow_path)
-
-        # Resolve the execution environment up front: the engine compiles the
-        # run manifest at construction, so an unresolvable name or a profile
-        # reference that misses every document must fail here — before any
-        # provider connects — surfacing through the CLI's ``print_error`` path.
-        resolved_environment = None
-        # ``is not None``, not truthiness: an explicitly empty selection
-        # (``--environment ""``, e.g. an unset variable forwarded as
-        # ``--environment "$ENVIRONMENT"``) must reach ``resolve_environment``
-        # and fail clearly, not silently fall back to the built-in
-        # environment — matching ``conductor validate``.
-        if environment is not None:
-            from conductor.config.environment import resolve_environment
-
-            resolved_environment = resolve_environment(
-                environment, workflow_dir=workflow_path.parent
-            )
 
         # Check if workflow uses multiple providers (has per-agent provider overrides)
         uses_multi_provider = any(
@@ -2595,6 +2688,8 @@ async def run_workflow_async(
                 instructions_preamble=instructions_preamble,
                 plugin_marketplaces=plugin_marketplaces,
                 execution_environment=resolved_environment,
+                secret_cache=secret_cache,
+                redactor=secret_redactor,
                 run_context=RunContext(
                     run_id=event_log_subscriber.run_id if event_log_subscriber else "",
                     log_file=str(event_log_subscriber.path) if event_log_subscriber else "",
@@ -2700,8 +2795,17 @@ async def run_workflow_async(
 
             if terminate_exc is not None:
                 # Re-raise so the CLI handler emits the non-zero exit code
-                # and prints the structured termination message/output.
-                raise terminate_exc
+                # and prints the structured termination message/output. The
+                # exception is re-created with scrubbed rendered fields —
+                # the CLI's terminate printer reads message/output/reason/
+                # suggestion verbatim, so the scrub happens here at the
+                # boundary rather than at the print sites.
+                raise _scrub_workflow_terminated(terminate_exc, secret_redactor)
+            if secret_redactor is not None and secret_redactor.active:
+                # Final stdout sink: app.py prints the returned dict (normal
+                # and --silent paths alike), so the boundary returns a
+                # scrubbed copy — the engine-produced dict is never mutated.
+                return secret_redactor.scrub_event_data(result)
             return result
     except BaseException as exc:
         if not isinstance(exc, WorkflowTerminated):
@@ -2712,12 +2816,38 @@ async def run_workflow_async(
             # already captured where it was raised, above, and re-raising
             # it here must not clobber that with a generic "failed"/no
             # message (MCP server plan E2).
+            if secret_redactor is not None and secret_redactor.active:
+                # The escaping exception reaches ``cli.app.print_error``
+                # AFTER the redactor is cleared below, so the fields the
+                # error renderer reads are scrubbed here at the boundary.
+                _scrub_exception_fields(exc, secret_redactor)
             terminal_status = "failed"
             terminal_error_type = type(exc).__name__
             terminal_error_message = str(exc)
         raise
     finally:
         try:
+            # Scrub the terminal-record copies while the redactor still holds
+            # the registered values: the CLI-owned pair is cleared only in
+            # the inner finally below, after these sinks drain. The redactor
+            # copies — the terminal locals above keep the engine-produced
+            # values untouched (Oracle R1-B7).
+            record_output = terminal_output
+            record_error_type = terminal_error_type
+            record_error_message = terminal_error_message
+            if secret_redactor is not None and secret_redactor.active:
+                record_output = secret_redactor.scrub_event_data(terminal_output)
+                record_error_type = (
+                    None
+                    if terminal_error_type is None
+                    else secret_redactor.scrub(terminal_error_type)
+                )
+                record_error_message = (
+                    None
+                    if terminal_error_message is None
+                    else secret_redactor.scrub(terminal_error_message)
+                )
+
             # Write the terminal run record (MCP server plan E2) before
             # removing the live one below, so a completed run remains
             # resolvable by run_id after this process exits. Never raises --
@@ -2727,9 +2857,9 @@ async def run_workflow_async(
                 workflow_path=workflow_path,
                 started_at=started_at_iso,
                 status=terminal_status,
-                output=terminal_output,
-                error_type=terminal_error_type,
-                error_message=terminal_error_message,
+                output=record_output,
+                error_type=record_error_type,
+                error_message=record_error_message,
                 engine=engine,
             )
 
@@ -2755,10 +2885,12 @@ async def run_workflow_async(
                 # Spans still open here never saw a terminal workflow event
                 # (interrupt/cancellation escaping the engine) — mark them
                 # failed rather than let them read as clean completions.
+                # ``telemetry_closed`` is written outside the emitter, so the
+                # scrubbed copies above are the arguments it receives.
                 telemetry_subscriber.close(
                     failed=terminal_status != "success",
-                    error_type=terminal_error_type,
-                    error_message=terminal_error_message,
+                    error_type=record_error_type,
+                    error_message=record_error_message,
                 )
 
             # Close JSONL event log and report path
@@ -2779,6 +2911,17 @@ async def run_workflow_async(
             except Exception:  # noqa: BLE001 -- teardown must preserve the workflow outcome.
                 logger.warning("Failed to close workflow file logging", exc_info=True)
         finally:
+            # Secret cleanup is the CLI's responsibility (the injected pair
+            # makes the engine's session non-owning) and runs only here —
+            # after the terminal record, telemetry close, and event-log close
+            # above have drained, so their scrubbed copies could still
+            # resolve values while they were being written.
+            if secret_cache is not None:
+                secret_cache.clear()
+            if secret_redactor is not None:
+                secret_redactor.clear()
+            if redaction_token is not None:
+                redaction.reset_current(redaction_token)
             # Provider shutdown occurs after the listener's inner ``finally``
             # and may itself touch the controlling TTY. Reapply the process
             # baseline at the outermost boundary so normal exit, Ctrl+C, and a
@@ -3159,6 +3302,12 @@ async def resume_workflow_async(
     terminal_error_message: str | None = None
     engine: WorkflowEngine | None = None
     resolved_workflow_path: Path | None = None
+    # CLI-owned secret machinery, mirroring ``run_workflow_async``: cleared
+    # with the contextvar restored in the outermost finally, after the
+    # resumed run's final sinks have drained.
+    secret_cache: SecretValueCache | None = None
+    secret_redactor: RunRedactor | None = None
+    redaction_token: Token[RunRedactor | None] | None = None
 
     try:
         # Resolve checkpoint file
@@ -3235,6 +3384,16 @@ async def resume_workflow_async(
                 environment, workflow_dir=resolved_workflow_path.parent
             )
 
+        # Secret prepare (parity with run) — STRICTLY BEFORE ``--guidance``
+        # application, the dashboard seeding (replay or synthetic), and the
+        # resume-generation ``workflow_started`` written directly to the
+        # JSONL log: every one of those is a sink a declared value could
+        # otherwise reach before the redactor exists.
+        secret_cache, secret_redactor, secret_uses = _prepare_run_secrets(
+            config, resolved_environment, emitter
+        )
+        redaction_token = redaction.set_current(secret_redactor)
+
         # Verify the current_agent exists in the workflow
         agent_names = {a.name for a in config.agents}
         parallel_names = {g.name for g in config.parallel} if config.parallel else set()
@@ -3277,9 +3436,15 @@ async def resume_workflow_async(
                 bg=bg_mode,
                 workflow_root=resolved_workflow_path.resolve().parent,
             )
+            # Replay seeding (JSONL replay + synthetic fallback) appends
+            # straight to dashboard history, bypassing the emitter's scrub —
+            # hand the dashboard the run redactor so each replayed payload is
+            # scrubbed before the history-append (identity passthrough when
+            # inactive, so a secret-less resume stays byte-identical).
+            dashboard.set_redactor(secret_redactor)
 
         # Build MCP servers config (same as run_workflow_async)
-        mcp_servers = await _build_mcp_servers(config)
+        mcp_servers = await _build_mcp_servers(config, secrets=secret_uses)
 
         # Same acquisition step as run: the checkpoint records no plugin
         # state, so a resumed run resolves its sources exactly as a fresh
@@ -3384,6 +3549,8 @@ async def resume_workflow_async(
                 instructions_preamble=cp.instructions_preamble,
                 plugin_marketplaces=plugin_marketplaces,
                 execution_environment=resolved_environment,
+                secret_cache=secret_cache,
+                redactor=secret_redactor,
                 run_context=RunContext(
                     run_id=event_log_subscriber.run_id,
                     log_file=str(event_log_subscriber.path),
@@ -3415,6 +3582,15 @@ async def resume_workflow_async(
             #      starts and treat the live run as a child workflow.
             if dashboard is not None:
                 workflow_started_data = await engine.build_workflow_started_data()
+                # The three sinks below — dashboard history prepend, the
+                # direct JSONL write, and the direct telemetry write — all
+                # bypass the emitter, so the emitter's scrub never reaches
+                # them, and the payload rendered from the restored context
+                # can carry a declared secret value. Scrub one copy up
+                # front: the redactor never mutates the dict the engine
+                # built (Oracle R1-B7).
+                if secret_redactor is not None and secret_redactor.active:
+                    workflow_started_data = secret_redactor.scrub_event_data(workflow_started_data)
                 dashboard.prepend_workflow_started(workflow_started_data)
                 # Persist a resume-generation marker directly to the JSONL
                 # log. The engine's own `workflow_started` emit is
@@ -3610,7 +3786,13 @@ async def resume_workflow_async(
                         await asyncio.Event().wait()
 
             if terminate_exc is not None:
-                raise terminate_exc
+                # Mirror of the matching arm in `run_workflow_async`: the
+                # re-raise carries scrubbed rendered fields for the CLI's
+                # terminate printer.
+                raise _scrub_workflow_terminated(terminate_exc, secret_redactor)
+            if secret_redactor is not None and secret_redactor.active:
+                # Final stdout sink — parity with run_workflow_async.
+                return secret_redactor.scrub_event_data(result)
             return result
     except BaseException as exc:
         if not isinstance(exc, WorkflowTerminated):
@@ -3619,12 +3801,34 @@ async def resume_workflow_async(
             # `WorkflowTerminated` branch above -- a setup error before the
             # engine ever ran (checkpoint resolution, config load, ...) or
             # one that escaped the inner try/except (MCP server plan E2).
+            if secret_redactor is not None and secret_redactor.active:
+                _scrub_exception_fields(exc, secret_redactor)
             terminal_status = "failed"
             terminal_error_type = type(exc).__name__
             terminal_error_message = str(exc)
         raise
     finally:
         try:
+            # Scrubbed terminal-record copies — mirrors run_workflow_async:
+            # the redactor still holds the registered values here (cleanup
+            # runs only in the inner finally below), and the copies leave the
+            # captured terminal locals untouched.
+            record_output = terminal_output
+            record_error_type = terminal_error_type
+            record_error_message = terminal_error_message
+            if secret_redactor is not None and secret_redactor.active:
+                record_output = secret_redactor.scrub_event_data(terminal_output)
+                record_error_type = (
+                    None
+                    if terminal_error_type is None
+                    else secret_redactor.scrub(terminal_error_type)
+                )
+                record_error_message = (
+                    None
+                    if terminal_error_message is None
+                    else secret_redactor.scrub(terminal_error_message)
+                )
+
             # Write the terminal run record (MCP server plan E2) before
             # removing the live one below -- mirrors run_workflow_async. A
             # resumed run reuses its predecessor's run_id, so this call
@@ -3635,9 +3839,9 @@ async def resume_workflow_async(
                 workflow_path=resolved_workflow_path,
                 started_at=started_at_iso,
                 status=terminal_status,
-                output=terminal_output,
-                error_type=terminal_error_type,
-                error_message=terminal_error_message,
+                output=record_output,
+                error_type=record_error_type,
+                error_message=record_error_message,
                 engine=engine,
             )
 
@@ -3655,10 +3859,15 @@ async def resume_workflow_async(
                     logger.warning("Failed to stop dashboard during resume cleanup", exc_info=True)
 
             if telemetry_subscriber is not None:
+                # Spans still open here never saw a terminal workflow event
+                # (interrupt/cancellation escaping the engine) — mark them
+                # failed rather than let them read as clean completions.
+                # ``telemetry_closed`` is written outside the emitter, so the
+                # scrubbed copies above are the arguments it receives.
                 telemetry_subscriber.close(
                     failed=terminal_status != "success",
-                    error_type=terminal_error_type,
-                    error_message=terminal_error_message,
+                    error_type=record_error_type,
+                    error_message=record_error_message,
                 )
 
             # Close JSONL event log and report path
@@ -3679,6 +3888,15 @@ async def resume_workflow_async(
             except Exception:  # noqa: BLE001 -- teardown must preserve the workflow outcome.
                 logger.warning("Failed to close resumed workflow file logging", exc_info=True)
         finally:
+            # CLI-owned secret cleanup — same discipline as
+            # ``run_workflow_async``: only after the terminal record,
+            # telemetry close, and event-log close above have drained.
+            if secret_cache is not None:
+                secret_cache.clear()
+            if secret_redactor is not None:
+                secret_redactor.clear()
+            if redaction_token is not None:
+                redaction.reset_current(redaction_token)
             # Keep resume teardown parity with ``run_workflow_async``.
             from conductor.interrupt.listener import restore_terminal_baseline
 
@@ -3760,13 +3978,64 @@ async def _prefetch_plugin_sources(config: Any, workflow_path: Path) -> dict[str
     return marketplaces_from(resolved)
 
 
-async def _build_mcp_servers(config: Any) -> dict[str, Any] | None:
+def _prepare_run_secrets(
+    config: WorkflowConfig,
+    resolved_environment: ResolvedEnvironment | None,
+    emitter: WorkflowEventEmitter,
+) -> tuple[SecretValueCache, RunRedactor, SecretUseIndex]:
+    """Prepare the run-scoped secret machinery owned by the CLI.
+
+    Creates the run redactor and value-cache pair, attaches the redactor to
+    the event emitter, and eagerly indexes the root config's declared secret
+    uses so an unknown reference, an ``allow``-policy violation, or an unset
+    source variable fails here — before MCP servers are built or plugin
+    sources are fetched — through the CLI's existing error printer.
+
+    The pair is injected into the engine constructor, so the engine's
+    session marks itself as non-owning and never clears it: cleanup after
+    the run's final sinks have drained (terminal record, telemetry close)
+    is the CLI's responsibility.
+
+    Args:
+        config: The loaded workflow configuration (root; sub-workflow configs
+            are indexed lazily by their own engines over the same cache).
+        resolved_environment: The ``--environment`` resolution, or ``None``
+            for the built-in environment.
+        emitter: The run's event emitter — scrubbed from this point on.
+
+    Returns:
+        The ``(cache, redactor, uses)`` triple: the engine constructor
+        consumes the first two; ``_build_mcp_servers`` consumes the third.
+
+    Raises:
+        ConfigurationError: If any declared secret reference fails to
+            resolve (unknown ref, disallowed consumer class, unset or empty
+            source variable, or a secret-less environment). Messages name
+            the reference, source variable, and consumer — never a value.
+    """
+    from conductor.config.environment import builtin_local_environment
+
+    redactor = RunRedactor()
+    cache = SecretValueCache(resolved_environment or builtin_local_environment(), redactor)
+    emitter.set_redactor(redactor)
+    uses = index_config(config, cache)
+    return cache, redactor, uses
+
+
+async def _build_mcp_servers(
+    config: Any,
+    secrets: SecretUseIndex | None = None,
+) -> dict[str, Any] | None:
     """Build MCP server configurations from workflow config.
 
     Extracted from ``run_workflow_async`` for reuse in ``resume_workflow_async``.
 
     Args:
         config: The workflow configuration.
+        secrets: The root config's resolved secret-use index, threading
+            declared secret deliveries into server resolution. ``None``
+            preserves the legacy translation byte-identically (used by
+            callers that never indexed the config).
 
     Returns:
         MCP server configurations dict, or None if none configured.
@@ -3776,6 +4045,12 @@ async def _build_mcp_servers(config: Any) -> dict[str, Any] | None:
 
     mcp_servers: dict[str, Any] = {}
     for name, server in config.workflow.runtime.mcp_servers.items():
+        if server.secrets and secrets is None:
+            raise ConfigurationError(
+                f"MCP server '{name}' declares secret references, but no resolved secret-use "
+                "index was provided.",
+                suggestion="Prepare the workflow's secrets before building MCP servers.",
+            )
         if server.type in ("http", "sse"):
             server_config: dict[str, Any] = {
                 "type": server.type,
@@ -3795,8 +4070,8 @@ async def _build_mcp_servers(config: Any) -> dict[str, Any] | None:
                 server_config["env"] = server.env
         if server.timeout:
             server_config["timeout"] = server.timeout
-        # The same pipeline plugin-declared servers go through, so the two
-        # sources cannot drift apart on env expansion or OAuth discovery.
-        mcp_servers[name] = await resolve_mcp_server_config(name, server_config)
+        mcp_servers[name] = await resolve_mcp_server_config(
+            name, server_config, secret_uses=secrets
+        )
     verbose_log(f"MCP servers configured: {list(mcp_servers.keys())}")
     return mcp_servers

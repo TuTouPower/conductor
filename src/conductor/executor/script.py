@@ -92,6 +92,8 @@ class ScriptExecutor:
         *,
         lease: WorkspaceLease | None = None,
         backend: RunnerBackend | None = None,
+        secret_env: dict[str, str] | None = None,
+        inherit_control_environment: bool = True,
     ) -> ScriptOutput:
         """Execute a script step.
 
@@ -109,6 +111,15 @@ class ScriptExecutor:
                 caller has none (default None).
             backend: Optional per-call backend override. When omitted, uses the
                 backend supplied at construction.
+            secret_env: Optional resolved secret deliveries (environment
+                variable name → plaintext value) merged verbatim into the
+                command's environment. ``None`` (the default) keeps the
+                pre-secrets behavior exactly.
+            inherit_control_environment: Effective inheritance policy from the
+                compiled run manifest. When False, the backend runs the command
+                on a minimal environment plus ``env`` instead of merging over
+                the control process's environment. Defaults to True (the local
+                backend's long-standing behavior).
 
         Returns:
             :class:`ScriptOutput` with stdout, stderr, exit_code, and stdin_bytes.
@@ -125,6 +136,16 @@ class ScriptExecutor:
         rendered_working_dir = (
             self.renderer.render(agent.working_dir, context) if agent.working_dir else None
         )
+        # Declared ``env`` values pass through verbatim — they are NOT
+        # Jinja-rendered, matching the long-standing contract. Secret
+        # deliveries merge on top verbatim as well (a secret value containing
+        # ``{{`` must reach the child byte-identically). A name collision
+        # between the two is rejected as a ``ConfigurationError`` by the
+        # engine's ``_execute_script`` before this call, so the plain update
+        # here cannot silently shadow an authored variable.
+        merged_env = dict(agent.env)
+        if secret_env:
+            merged_env.update(secret_env)
 
         # Render the optional stdin payload. ``None`` means "inherit the
         # parent's stdin" (the legacy behavior); any string — including an
@@ -164,7 +185,8 @@ class ScriptExecutor:
             command=rendered_command,
             args=tuple(rendered_args),
             working_dir=rendered_working_dir,
-            env=dict(agent.env),
+            env=merged_env,
+            inherit_control_environment=inherit_control_environment,
             stdin=stdin_payload,
             timeout=agent.timeout,
         )
@@ -210,8 +232,24 @@ class ScriptExecutor:
 
     @staticmethod
     def _make_diagnostics() -> Callable[[str], None]:
-        """Adapt backend diagnostics to the existing verbose logger."""
-        return _verbose_log
+        """Adapt backend diagnostics to the existing verbose logger.
+
+        Backend diagnostics carry the child's stderr, so the text is scrubbed
+        through the run-scoped redactor (when one is active in the current
+        context) before reaching the verbose console / ``--log-file``: a
+        script that prints a delivered credential to stderr would otherwise
+        write it to both. The live subprocess result is untouched.
+        """
+
+        def _log_diagnostic(message: str) -> None:
+            from conductor import redaction
+
+            redactor = redaction.current()
+            if redactor is not None and redactor.active:
+                message = redactor.scrub(message)
+            _verbose_log(message)
+
+        return _log_diagnostic
 
     @staticmethod
     def _reconstruct_start_error(result: CommandResult) -> OSError:
